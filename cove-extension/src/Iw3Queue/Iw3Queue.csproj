@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Iw3Queue</AssemblyName>
+    <RootNamespace>Iw3Queue</RootNamespace>
+    <!-- Extension assemblies are loaded into their own AssemblyLoadContext. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <!-- Never ship host assemblies alongside the extension: the host provides them. -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- Cove.Plugins exposes ASP.NET Core types (IEndpointRouteBuilder, HttpContext) in the
+       capability interfaces, so the compiler needs the shared framework to resolve them. -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- Compiled against DLLs taken from the RUNNING container (cove-gpu:2026-08-24-v1.3.1),
+       never against a source checkout: the deployed build lags main and the contract differs. -->
+  <ItemGroup>
+    <Reference Include="Cove.Sdk"><HintPath>../../refs/Cove.Sdk.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Cove.Plugins"><HintPath>../../refs/Cove.Plugins.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Cove.Core"><HintPath>../../refs/Cove.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Cove.Data"><HintPath>../../refs/Cove.Data.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <!-- Reference-only: these types appear in Cove signatures the compiler must resolve. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.10" ExcludeAssets="runtime" />
+    <PackageReference Include="Pgvector" Version="0.3.2" ExcludeAssets="runtime" />
+    <!-- Pgvector drags in Npgsql 8; Cove.Data is built against 10. Pin it or the build warns
+         about an unresolvable assembly conflict (same fix as path-autotag). -->
+    <PackageReference Include="Npgsql" Version="10.0.3" ExcludeAssets="runtime" />
+    <PackageReference Include="MediatR.Contracts" Version="2.0.1" ExcludeAssets="runtime" />
+  </ItemGroup>
+</Project>

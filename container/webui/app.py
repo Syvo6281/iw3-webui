@@ -1,0 +1,957 @@
+"""
+Browser UI for iw3, on top of the Phase 1 headless converter.
+
+Deliberately does NOT import iw3.gui (wxPython desktop app) - see Phase 2
+notes: the desktop GUI has no job queue, no persistence, no streaming logs,
+none of what was actually asked for. This shells out to `python -m iw3`
+per job instead, one job at a time, and manages the queue itself.
+"""
+import sys
+sys.path.insert(0, "/opt/nunif")
+
+import asyncio
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import statistics
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from iw3.utils import create_parser
+
+NUNIF_HOME = os.environ.get("NUNIF_HOME", "/config")
+INPUT_ROOT = Path("/input").resolve()
+OUTPUT_ROOT = Path("/output").resolve()
+WEBUI_DIR = Path(NUNIF_HOME) / "webui"
+LOG_DIR = WEBUI_DIR / "logs"
+DB_PATH = WEBUI_DIR / "jobs.db"
+NUNIF_DIR = Path("/opt/nunif")
+
+WEBUI_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Preview mode cuts a short clip out of the middle of the source and converts
+# *that* with the very settings the job carries. It used to pass iw3's
+# --keyframe instead, which only ever produced stills - and stills cannot show
+# the one thing a 3D preview has to answer: whether depth stays stable while
+# the picture moves. The middle is taken because the head of a file is titles,
+# logos and fades often enough to be unrepresentative.
+PREVIEW_CLIP_SECONDS = float(os.environ.get("PREVIEW_CLIP_SECONDS", "120"))
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+# Passed straight to iw3's --gpu. "-1" is iw3's own spelling for CPU; a second
+# card is "1". Only one job runs at a time either way - iw3 was not built to
+# share a device between concurrent conversions.
+IW3_GPU = os.environ.get("IW3_GPU", "0")
+
+# ---------------------------------------------------------------------------
+# Settings schema - introspected from iw3's own argparse parser so defaults
+# and choices never drift out of sync with the installed nunif version.
+# The *set* of fields exposed (and how they're grouped into widgets) is a UI
+# decision and is hardcoded; the *values* (default/choices) are read live.
+# ---------------------------------------------------------------------------
+_parser = create_parser(required_true=False)
+_defaults = {action.dest: action.default for action in _parser._actions}
+_choices = {action.dest: action.choices for action in _parser._actions}
+
+
+def _field(dest, label, kind, **extra):
+    f = {"dest": dest, "label": label, "kind": kind, "default": _defaults.get(dest)}
+    if _choices.get(dest):
+        f["choices"] = list(_choices[dest])
+    f.update(extra)
+    return f
+
+
+SETTINGS_SCHEMA = [
+    _field("depth_model", "Depth model", "select"),
+    _field("divergence", "Divergence (3D strength)", "float", min=0, max=10, step=0.1,
+           help="0-2 is reasonable. Higher = more pop, more eye strain."),
+    _field("convergence", "Convergence (screen plane)", "float", min=0, max=1, step=0.05,
+           help="0-1 reasonable. 0.5 pulls part of the scene in front of the screen."),
+    _field("foreground_scale", "Foreground scale", "float", min=-3, max=3, step=0.1,
+           help="0 disabled. Source: iw3 argparse Range(-3.0, 3.0)."),
+    _field("edge_dilation", "Edge dilation (x, y)", "int_pair", default=[2, 1]),
+    _field("video_codec", "Video codec", "select",
+           choices=["libx264", "libx265", "libopenh264", "utvideo", "ffv1"],
+           help="No VAAPI/QSV path exists in iw3 - see Phase 1 notes. All software encode."),
+    _field("pix_fmt", "Pixel format", "select"),
+    _field("max_fps", "Max FPS", "float", min=1, max=120, step=1),
+    _field("scene_detect", "Scene detection", "bool",
+           help="Recommended for VDA depth models - resets state at hard cuts."),
+    _field("ema_normalize", "Flicker reduction (EMA normalize)", "bool",
+           help="Recommended for VDA depth models."),
+    _field("ema_decay", "  EMA decay", "float", min=0, max=1, step=0.01),
+    _field("ema_buffer", "  EMA lookahead buffer (frames)", "int", min=1, max=240),
+]
+
+STEREO_FORMATS = [
+    {"value": "full_sbs", "label": "Full SBS (default)", "flags": {}},
+    {"value": "half_sbs", "label": "Half SBS", "flags": {"half_sbs": True}},
+    {"value": "tb", "label": "Full Top-Bottom", "flags": {"tb": True}},
+    {"value": "half_tb", "label": "Half Top-Bottom", "flags": {"half_tb": True}},
+    {"value": "vr180", "label": "VR180", "flags": {"vr180": True}},
+    {"value": "cross_eyed", "label": "Cross-eyed", "flags": {"cross_eyed": True}},
+    {"value": "rgbd", "label": "RGBD", "flags": {"rgbd": True}},
+    {"value": "half_rgbd", "label": "Half RGBD", "flags": {"half_rgbd": True}},
+    {"value": "anaglyph", "label": "Anaglyph (Dubois)", "flags": {"anaglyph": "dubois"}},
+]
+
+# ---------------------------------------------------------------------------
+# Job store (SQLite under $NUNIF_HOME so the queue survives container restarts)
+# ---------------------------------------------------------------------------
+_db_lock = asyncio.Lock()
+
+
+def _db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    with _db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                input_path TEXT NOT NULL,
+                recursive INTEGER NOT NULL DEFAULT 0,
+                stereo_format TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                error TEXT
+            )
+        """)
+        # Crash recovery: a 'running' row means the container died mid-job.
+        conn.execute("UPDATE jobs SET status='queued', started_at=NULL "
+                      "WHERE status='running'")
+
+
+_init_db()
+
+# job_id -> asyncio.subprocess.Process, for cancellation of the current job
+_running_procs: dict[str, asyncio.subprocess.Process] = {}
+# job_id -> set of asyncio.Queue, for SSE log tailing
+_log_subscribers: dict[str, set] = {}
+# job_id -> progress dict, parsed live from iw3's tqdm output. In memory only:
+# progress is meaningless for a job that isn't running, and a container restart
+# resets running jobs to 'queued' anyway (see _init_db).
+_job_progress: dict[str, dict] = {}
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Progress parsing
+#
+# iw3 drives tqdm, which already computes everything a progress bar needs -
+# there is no reason to estimate any of it ourselves. A job emits these in
+# sequence:
+#
+#   1. the Scene Boundary Detection pre-pass, which is itself a full bar:
+#        "clip.mp4: Scene Boundary Detection:  72%|###  | 9911/13778 [00:14<00:05, 675.8it/s]"
+#      and finishes with an unbounded summary line:
+#        "clip.mp4: Scene Boundary Detection: 13779it [00:20, 675.87it/s]"
+#   2. the conversion pass, the one worth showing as *the* progress:
+#        "clip.mp4:  29%|####      | 3928/13778 [12:12<23:13,  7.07it/s]"
+#
+# So bounded-vs-unbounded does NOT identify the pass - both passes draw a
+# percentage. The description does: iw3 sets tqdm_title to
+# f"{basename}: Scene Boundary Detection" for the pre-pass (iw3/utils.py:1031)
+# and to the bare basename for the conversion. Hence the greedy desc capture.
+#
+# Two further shapes seen in real logs and handled below: the clock is
+# [H:]MM:SS ("[11:19<1:30:41"), and tqdm flips to "s/it" instead of "it/s"
+# once a step takes over a second ("2.94s/it").
+# ---------------------------------------------------------------------------
+_SCENE_DETECT_TITLE = "Scene Boundary Detection"
+
+_TQDM_BOUNDED = re.compile(
+    r"(?P<desc>.*):\s+(?P<pct>\d+)%\|[^|]*\|\s*(?P<n>\d+)/(?P<total>\d+)"
+    r"\s*\[(?P<elapsed>[0-9:]+)<(?P<remaining>[0-9:?]+),\s*(?P<rate>[0-9.]+)(?P<unit>it/s|s/it)"
+)
+_TQDM_UNBOUNDED = re.compile(
+    r"(?P<desc>.*):\s+(?P<n>\d+)it\s*\[(?P<elapsed>[0-9:]+),\s*(?P<rate>[0-9.]+)(?P<unit>it/s|s/it)"
+)
+
+
+def _tqdm_seconds(clock: str):
+    """tqdm prints [H:]MM:SS, and '?' while it has no estimate yet."""
+    if not clock or "?" in clock:
+        return None
+    parts = clock.split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except ValueError:
+        return None
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds
+
+
+def _phase_of(desc: str):
+    return "scene_detect" if desc.rstrip().endswith(_SCENE_DETECT_TITLE) else "convert"
+
+
+def _rate_to_fps(value: str, unit: str):
+    rate = float(value)
+    # Normalise s/it to it/s so the UI only ever deals with one unit.
+    if unit == "s/it":
+        return 1.0 / rate if rate else 0.0
+    return rate
+
+
+def _parse_progress(text: str):
+    m = _TQDM_BOUNDED.search(text)
+    if m:
+        total = int(m.group("total"))
+        n = int(m.group("n"))
+        return {
+            "phase": _phase_of(m.group("desc")),
+            "frames": n,
+            "total_frames": total,
+            "percent": round(100.0 * n / total, 1) if total else None,
+            "elapsed_sec": _tqdm_seconds(m.group("elapsed")),
+            "eta_sec": _tqdm_seconds(m.group("remaining")),
+            "rate_fps": round(_rate_to_fps(m.group("rate"), m.group("unit")), 2),
+        }
+    m = _TQDM_UNBOUNDED.search(text)
+    if m:
+        return {
+            # tqdm's unbounded form knows no total, so there is no honest
+            # percentage and no ETA to report for it.
+            "phase": _phase_of(m.group("desc")),
+            "frames": int(m.group("n")),
+            "total_frames": None,
+            "percent": None,
+            "elapsed_sec": _tqdm_seconds(m.group("elapsed")),
+            "eta_sec": None,
+            "rate_fps": round(_rate_to_fps(m.group("rate"), m.group("unit")), 2),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Estimating queued jobs
+#
+# A queued job has produced no tqdm output yet, so its runtime has to be
+# estimated. Runtime scales with the number of frames actually processed
+# (duration x effective fps), not with clip length - and the per-frame rate
+# depends on the depth model and the resolution.
+#
+# The rates are read back out of this installation's own finished jobs, so an
+# ETA describes the machine it is shown on rather than the machine this was
+# written on. The seed table below only fills combinations that have never run
+# here yet: one local measurement beats somebody else's median.
+#
+# Seed values are medians over the 34 jobs completed on an Intel Arc Pro B60 as
+# of 2026-08-28. Within each group the spread was small - VDA_B/1080p ran
+# 6.01-7.28 fps across 8 jobs.
+# ---------------------------------------------------------------------------
+SEED_THROUGHPUT_FPS = {
+    ("VDA_B", "4k"): 2.58,
+    ("VDA_B", "hd"): 6.56,
+    ("VDA_L", "hd"): 2.97,
+    ("ZoeD_Any_N", "4k"): 4.59,
+    ("ZoeD_Any_N", "hd"): 9.38,
+}
+# Used when neither this machine nor the seed table knows the model.
+# Deliberately the slowest seeded rate rather than an average: overestimating
+# the wait is the less annoying error.
+FALLBACK_FPS = {"4k": 2.58, "hd": 2.97}
+
+# job_id -> (model, bucket, fps) | None. A source that cannot be probed (moved,
+# deleted after conversion) stays None and is simply never a sample.
+_rate_samples: dict[str, tuple | None] = {}
+_calibration: dict[tuple, float] = {}
+_calibration_size = -1
+
+
+def _bucket(height):
+    return "4k" if (height or 0) >= 1600 else "hd"
+
+
+def _job_rate(row):
+    """Frames per second a finished job actually achieved."""
+    if row["mode"] != "convert" or row["recursive"]:
+        # A preview converts an extracted clip that is deleted afterwards, and
+        # a folder job is many files under one timestamp: neither is a clean
+        # measurement of one file's throughput.
+        return None
+    if not row["started_at"] or not row["finished_at"]:
+        return None
+    try:
+        elapsed = (datetime.fromisoformat(row["finished_at"])
+                   - datetime.fromisoformat(row["started_at"])).total_seconds()
+    except ValueError:
+        return None
+    if elapsed <= 0:
+        return None
+    info = _probe_video(INPUT_ROOT / row["input_path"])
+    if not info or not info.get("duration_sec") or not info.get("fps"):
+        return None
+    params = json.loads(row["params_json"])
+    max_fps = params.get("max_fps") or _defaults.get("max_fps") or 30
+    frames = info["duration_sec"] * min(info["fps"], float(max_fps))
+    model = params.get("depth_model") or _defaults.get("depth_model")
+    return model, _bucket(info.get("height")), frames / elapsed
+
+
+def _throughput():
+    """Measured rates per (depth model, resolution bucket) for this machine.
+
+    Median rather than mean: a job that was silently interrupted, or one that
+    shared the GPU with something else, otherwise drags a whole group with it.
+    """
+    global _calibration, _calibration_size
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status='done' AND mode='convert' AND recursive=0"
+        ).fetchall()
+    if len(rows) == _calibration_size:
+        return _calibration
+
+    groups: dict[tuple, list] = {}
+    for r in rows:
+        if r["id"] not in _rate_samples:
+            _rate_samples[r["id"]] = _job_rate(r)
+        sample = _rate_samples[r["id"]]
+        if sample:
+            groups.setdefault((sample[0], sample[1]), []).append(sample[2])
+    _calibration = {k: statistics.median(v) for k, v in groups.items()}
+    _calibration_size = len(rows)
+    return _calibration
+
+def _running_eta(job_row, progress):
+    """(seconds_left, is_estimate) for the job currently running.
+
+    tqdm's own remaining-time is only usable once the *conversion* pass is
+    running. During the Scene Boundary Detection pre-pass its ETA describes
+    that pre-pass alone - a few seconds - which would wildly understate the
+    job. Fall back to the measured-throughput estimate until then.
+    """
+    if progress and progress.get("phase") == "convert" and progress.get("eta_sec") is not None:
+        return progress["eta_sec"], False
+    return _estimate_seconds(job_row), True
+
+
+_probe_cache: dict[tuple, dict] = {}
+
+
+def _probe_video(path: Path):
+    """Duration/fps/height for a source file. Cached on (path, size, mtime)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_size, int(st.st_mtime))
+    if key in _probe_cache:
+        return _probe_cache[key]
+    try:
+        import av
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            info = {
+                "duration_sec": float(container.duration / 1_000_000) if container.duration else None,
+                "fps": float(stream.average_rate) if stream.average_rate else None,
+                "height": stream.codec_context.height,
+            }
+    except Exception:
+        info = None
+    _probe_cache[key] = info
+    return info
+
+
+def _estimate_seconds(job_row):
+    """Rough runtime estimate for a job that hasn't started yet."""
+    if job_row["recursive"]:
+        # A folder job is N unknown files; not worth a fake number.
+        return None
+    try:
+        path = _safe_input_path(job_row["input_path"])
+    except HTTPException:
+        return None
+    info = _probe_video(path)
+    if not info or not info.get("duration_sec") or not info.get("fps"):
+        return None
+
+    params = json.loads(job_row["params_json"])
+    max_fps = params.get("max_fps") or _defaults.get("max_fps") or 30
+    effective_fps = min(info["fps"], float(max_fps))
+    # A preview only ever converts the extracted clip, so the source length
+    # beyond it costs nothing. Cutting the clip itself is a stream copy of a
+    # few seconds and is not worth modelling.
+    duration = info["duration_sec"]
+    if job_row["mode"] == "preview":
+        duration = min(duration, PREVIEW_CLIP_SECONDS)
+    frames = duration * effective_fps
+
+    bucket = _bucket(info.get("height"))
+    model = params.get("depth_model") or _defaults.get("depth_model")
+    rate = (_throughput().get((model, bucket))
+            or SEED_THROUGHPUT_FPS.get((model, bucket))
+            or FALLBACK_FPS[bucket])
+    return frames / rate
+
+
+def _preview_dir(job_id) -> Path:
+    return OUTPUT_ROOT / "_previews" / job_id
+
+
+def _preview_window(duration_sec, clip_sec):
+    """(start, length) of the centred clip. Shorter sources are taken whole."""
+    if not duration_sec or duration_sec <= clip_sec:
+        return 0.0, None
+    return (duration_sec - clip_sec) / 2.0, clip_sec
+
+
+def _build_argv(job_row, input_path=None, out_dir=None):
+    params = json.loads(job_row["params_json"])
+    if input_path is None:
+        input_path = INPUT_ROOT / job_row["input_path"]
+    if out_dir is None:
+        out_dir = _preview_dir(job_row["id"]) if job_row["mode"] == "preview" else OUTPUT_ROOT
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    argv = ["python3", "-m", "iw3", "-i", str(input_path), "-o", str(out_dir), "-y", "--gpu", IW3_GPU]
+
+    if job_row["recursive"]:
+        argv.append("--recursive")
+        argv.append("--skip-error")
+
+    for f in SETTINGS_SCHEMA:
+        dest = f["dest"]
+        if dest not in params:
+            continue
+        val = params[dest]
+        flag = "--" + dest.replace("_", "-")
+        if f["kind"] == "bool":
+            if val:
+                argv.append(flag)
+        elif f["kind"] == "int_pair":
+            argv += [flag, str(val[0]), str(val[1])]
+        else:
+            argv += [flag, str(val)]
+
+    fmt = next((s for s in STEREO_FORMATS if s["value"] == job_row["stereo_format"]), STEREO_FORMATS[0])
+    for k, v in fmt["flags"].items():
+        flag = "--" + k.replace("_", "-")
+        if v is True:
+            argv.append(flag)
+        else:
+            argv += [flag, str(v)]
+
+    return argv
+
+
+async def _publish_log(job_id, line):
+    for q in _log_subscribers.get(job_id, ()):
+        q.put_nowait(line)
+
+
+async def _run_logged(job_id, argv, logf):
+    """Run a helper process, streaming its output into the job log.
+
+    Registered in _running_procs like the conversion itself, so cancelling a
+    job during clip extraction works the same way it does mid-conversion.
+    """
+    await _write_log(job_id, logf, f"$ {' '.join(argv)}\n")
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    _running_procs[job_id] = proc
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            await _write_log(job_id, logf, line.decode(errors="replace"))
+        return await proc.wait()
+    finally:
+        _running_procs.pop(job_id, None)
+
+
+async def _write_log(job_id, logf, text):
+    logf.write(text)
+    logf.flush()
+    await _publish_log(job_id, text)
+
+
+async def _extract_preview_clip(job_id, src: Path, dest: Path, logf):
+    """Cut PREVIEW_CLIP_SECONDS out of the middle of src into dest."""
+    info = _probe_video(src)
+    start, length = _preview_window((info or {}).get("duration_sec"), PREVIEW_CLIP_SECONDS)
+    if length is None:
+        await _write_log(job_id, logf,
+                          f"[preview] source is shorter than {PREVIEW_CLIP_SECONDS:g}s, using it whole\n")
+    else:
+        await _write_log(job_id, logf,
+                          f"[preview] cutting {length:g}s from {start:.1f}s (middle of the source)\n")
+
+    # -nostats keeps ffmpeg's \r progress out of a log viewer that is already
+    # busy throttling iw3's.
+    base = [FFMPEG_BIN, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "warning", "-y"]
+    # -ss *before* -i is an input seek: it lands on the keyframe at or before
+    # the mark, which is exactly what a stream copy needs.
+    window = (["-ss", f"{start:.3f}"] if start else []) + ["-i", str(src)]
+    window += ["-t", f"{length:.3f}"] if length else []
+    # Only the first video and (if present) the first audio track: subtitle and
+    # attachment streams carried over from a container like MKV have no place
+    # in the mp4 the clip is written to.
+    maps = ["-map", "0:v:0", "-map", "0:a:0?"]
+
+    # The video is copied, never re-encoded: the clip has to look exactly like
+    # the source or it cannot be used to judge the source. The audio is
+    # re-encoded unconditionally - mp4 refuses plenty of the audio codecs that
+    # arrive in mkv/wmv containers, and two minutes of AAC costs no measurable
+    # time. That keeps the fallback below for the one case that really needs
+    # it: a video codec mp4 cannot hold at all.
+    rc = await _run_logged(job_id, base + window + maps +
+                            ["-c:v", "copy", "-c:a", "aac",
+                             "-avoid_negative_ts", "make_zero", str(dest)], logf)
+    if rc < 0:
+        # Killed by a signal - that is a cancellation, not a bad source.
+        raise RuntimeError(f"preview extraction terminated by signal {-rc}")
+    if rc == 0 and dest.exists() and dest.stat().st_size > 0:
+        return
+
+    # Re-encoding two minutes is a moment of CPU and always works.
+    await _write_log(job_id, logf, "[preview] stream copy failed, re-encoding the clip instead\n")
+    rc = await _run_logged(job_id, base + window + maps +
+                            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                             "-pix_fmt", "yuv420p", "-c:a", "aac", str(dest)], logf)
+    if rc != 0 or not dest.exists() or dest.stat().st_size == 0:
+        raise RuntimeError(f"preview clip extraction failed (ffmpeg exit code {rc})")
+
+
+async def _run_job(job_id):
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        return
+
+    log_path = LOG_DIR / f"{job_id}.log"
+
+    with _db() as conn:
+        conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (_now(), job_id))
+        conn.commit()
+
+    clip_path = None
+    with open(log_path, "a") as logf:
+        if row["mode"] == "preview":
+            src = _safe_input_path(row["input_path"])
+            out_dir = _preview_dir(job_id)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # iw3 names its output after the input's basename, so the _preview
+            # suffix carries through to <name>_preview_LRF_Full_SBS.mp4 and a
+            # preview can never be mistaken for a finished conversion.
+            clip_path = out_dir / f"{src.stem}_preview.mp4"
+            _job_progress[job_id] = {"phase": "extract", "percent": None, "frames": None,
+                                     "total_frames": None, "elapsed_sec": None,
+                                     "eta_sec": None, "rate_fps": None}
+            try:
+                await _extract_preview_clip(job_id, src, clip_path, logf)
+            except Exception as e:
+                # Report it as a finished-and-failed job rather than letting it
+                # escape to the worker loop: an open log viewer waits for the
+                # end marker below and would otherwise hang on a dead job.
+                await _write_log(job_id, logf, f"\n[job failed, {e}]\n")
+                with _db() as conn:
+                    conn.execute("UPDATE jobs SET status='failed', finished_at=?, error=? WHERE id=?",
+                                  (_now(), str(e), job_id))
+                    conn.commit()
+                await _publish_log(job_id, "__EOF__")
+                return
+            finally:
+                _job_progress.pop(job_id, None)
+            argv = _build_argv(row, input_path=clip_path, out_dir=out_dir)
+        else:
+            argv = _build_argv(row)
+
+        await _write_log(job_id, logf, f"$ {' '.join(argv)}\n")
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=str(NUNIF_DIR),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        _running_procs[job_id] = proc
+        try:
+            # iw3 uses carriage returns for tqdm progress - a real terminal
+            # overwrites the same line on \r rather than accumulating one
+            # stored line per tick. A multi-hour job can emit tens of
+            # thousands of \r ticks; storing (and later replaying) every one
+            # of them as a separate log line is what crashed the log viewer.
+            # \n-terminated lines are real output and always flush
+            # immediately; \r progress ticks are throttled to ~2/sec.
+            buf = b""
+            last_progress_flush = 0.0
+            PROGRESS_THROTTLE_SEC = 0.5
+            while True:
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf or b"\r" in buf:
+                    idx_n = buf.find(b"\n")
+                    idx_r = buf.find(b"\r")
+                    if idx_n != -1 and (idx_r == -1 or idx_n < idx_r):
+                        idx, is_progress = idx_n, False
+                    else:
+                        idx, is_progress = idx_r, True
+                    line, buf = buf[:idx], buf[idx + 1:]
+                    text = line.decode(errors="replace") + "\n"
+                    # Parse before the throttle: the log only needs ~2 ticks a
+                    # second, but the progress bar should reflect the newest
+                    # tick we have actually seen.
+                    parsed = _parse_progress(text)
+                    if parsed:
+                        _job_progress[job_id] = parsed
+                    now = time.monotonic()
+                    if is_progress and now - last_progress_flush < PROGRESS_THROTTLE_SEC:
+                        continue
+                    last_progress_flush = now
+                    logf.write(text)
+                    logf.flush()
+                    await _publish_log(job_id, text)
+            if buf:
+                text = buf.decode(errors="replace") + "\n"
+                logf.write(text)
+                await _publish_log(job_id, text)
+            returncode = await proc.wait()
+        finally:
+            _running_procs.pop(job_id, None)
+            _job_progress.pop(job_id, None)
+
+    status = "done" if returncode == 0 else "failed"
+    if clip_path is not None:
+        if status == "done":
+            # The clip is an intermediate, reproducible in seconds. Only the
+            # stereo output next to it is worth keeping.
+            try:
+                clip_path.unlink()
+            except OSError:
+                pass
+        else:
+            await _publish_log(job_id, f"[preview] clip kept for inspection: {clip_path}\n")
+    with _db() as conn:
+        conn.execute("UPDATE jobs SET status=?, finished_at=?, error=? WHERE id=?",
+                      (status, _now(), None if returncode == 0 else f"exit code {returncode}", job_id))
+        conn.commit()
+    await _publish_log(job_id, f"\n[job {status}, exit code {returncode}]\n")
+    await _publish_log(job_id, "__EOF__")
+
+
+async def _worker_loop():
+    while True:
+        with _db() as conn:
+            # Previews go first. The whole point of a preview is to see the
+            # settings before committing the hours a full conversion costs -
+            # behind a queue that is days deep it would answer the question
+            # long after the question stopped mattering. It still waits for the
+            # running job: nothing here interrupts work already on the GPU.
+            row = conn.execute(
+                "SELECT id FROM jobs WHERE status='queued' "
+                "ORDER BY mode <> 'preview', created_at LIMIT 1"
+            ).fetchone()
+        if row is None:
+            await asyncio.sleep(1.0)
+            continue
+        # One job at a time - the GPU cannot be shared across concurrent conversions.
+        try:
+            await _run_job(row["id"])
+        except Exception as e:
+            with _db() as conn:
+                conn.execute("UPDATE jobs SET status='failed', finished_at=?, error=? WHERE id=?",
+                              (_now(), str(e), row["id"]))
+                conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+app = FastAPI()
+
+
+@app.on_event("startup")
+async def _startup():
+    asyncio.create_task(_worker_loop())
+
+
+class JobCreate(BaseModel):
+    mode: str  # "convert" | "preview"
+    input_path: str  # relative to /input
+    recursive: bool = False
+    stereo_format: str = "full_sbs"
+    params: dict
+
+
+def _safe_input_path(rel_path: str) -> Path:
+    p = (INPUT_ROOT / rel_path.lstrip("/")).resolve()
+    if INPUT_ROOT not in p.parents and p != INPUT_ROOT:
+        raise HTTPException(400, "path escapes /input")
+    return p
+
+
+@app.get("/api/schema")
+def get_schema():
+    return {"fields": SETTINGS_SCHEMA, "stereo_formats": STEREO_FORMATS}
+
+
+@app.get("/api/health")
+def health():
+    """What this container can actually reach - the question a build cannot answer.
+
+    A `docker build` host usually has no GPU passed in, so "does torch see the
+    device" is only decidable here, with the container's real devices attached.
+    First stop when conversions are unexpectedly slow: an empty accelerator
+    list means everything is running on the CPU.
+    """
+    import torch
+    accelerators = {}
+    for name in ("xpu", "cuda"):
+        backend = getattr(torch, name, None)
+        if backend is None:
+            continue
+        try:
+            available = bool(backend.is_available())
+            accelerators[name] = {
+                "available": available,
+                "devices": backend.device_count() if available else 0,
+            }
+        except Exception as e:  # a broken driver raises rather than returning False
+            accelerators[name] = {"available": False, "error": str(e)}
+    return {
+        "torch": torch.__version__,
+        "accelerators": accelerators,
+        "iw3_gpu": IW3_GPU,
+        "ffmpeg": shutil.which(FFMPEG_BIN),
+        "preview_clip_seconds": PREVIEW_CLIP_SECONDS,
+        "input_root": str(INPUT_ROOT),
+        "output_root": str(OUTPUT_ROOT),
+    }
+
+
+@app.get("/api/throughput")
+def throughput():
+    """The rates the queue's ETAs are built on, and where each one came from."""
+    measured = _throughput()
+    keys = sorted(set(measured) | set(SEED_THROUGHPUT_FPS))
+    return {
+        "rates": [
+            {
+                "depth_model": model,
+                "resolution": bucket,
+                "fps": round(measured.get((model, bucket), SEED_THROUGHPUT_FPS.get((model, bucket))), 2),
+                "source": "measured here" if (model, bucket) in measured else "seed (Arc Pro B60)",
+            }
+            for model, bucket in keys
+        ],
+        "jobs_measured": sum(1 for s in _rate_samples.values() if s),
+    }
+
+
+@app.get("/api/browse")
+def browse(path: str = ""):
+    target = _safe_input_path(path)
+    if not target.exists():
+        raise HTTPException(404, "not found")
+    if target.is_file():
+        raise HTTPException(400, "not a directory")
+    entries = []
+    for entry in sorted(target.iterdir(), key=lambda e: (e.is_file(), e.name.lower())):
+        rel = str(entry.relative_to(INPUT_ROOT))
+        entries.append({
+            "name": entry.name,
+            "path": rel,
+            "type": "dir" if entry.is_dir() else "file",
+        })
+    return {"path": str(target.relative_to(INPUT_ROOT)) if target != INPUT_ROOT else "", "entries": entries}
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    with _db() as conn:
+        rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 200").fetchall()
+
+    jobs = []
+    for r in rows:
+        job = dict(r)
+        job["progress"] = None
+        job["eta_sec"] = None
+        job["eta_estimated"] = False
+
+        if job["status"] == "running":
+            progress = _job_progress.get(job["id"])
+            job["progress"] = progress
+            eta = _running_eta(r, progress)
+            job["eta_sec"] = eta[0]
+            job["eta_estimated"] = eta[1]
+        elif job["status"] == "queued":
+            job["eta_sec"] = _estimate_seconds(r)
+            job["eta_estimated"] = job["eta_sec"] is not None
+        jobs.append(job)
+
+    return jobs
+
+
+@app.get("/api/queue-eta")
+def queue_eta():
+    """Total time left: the running job's own ETA plus estimates for the rest.
+
+    Queue order is by created_at (same as _worker_loop), so the numbers line up
+    with the order things will actually run in.
+    """
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status IN ('running','queued') ORDER BY created_at"
+        ).fetchall()
+
+    total = 0.0
+    exact = True  # false once any part of the sum is a model-based estimate
+    counted = 0
+    for r in rows:
+        if r["status"] == "running":
+            seconds, estimated = _running_eta(r, _job_progress.get(r["id"]))
+            if estimated:
+                exact = False
+        else:
+            seconds = _estimate_seconds(r)
+            exact = False
+        if seconds is None:
+            # Unprobeable file (or a recursive folder job): can't be counted,
+            # so say so rather than silently understating the total.
+            continue
+        total += seconds
+        counted += 1
+
+    return {
+        "jobs": len(rows),
+        "jobs_counted": counted,
+        "total_sec": round(total) if counted else None,
+        "exact": exact,
+    }
+
+
+@app.post("/api/jobs")
+def create_job(job: JobCreate):
+    if job.mode not in ("convert", "preview"):
+        raise HTTPException(400, "mode must be convert or preview")
+    if not job.input_path.strip():
+        raise HTTPException(400, "input_path must not be empty (refusing to default to the whole /input root)")
+    target = _safe_input_path(job.input_path)
+    if not target.exists():
+        raise HTTPException(400, f"input path does not exist: {job.input_path}")
+    if job.stereo_format not in {s["value"] for s in STEREO_FORMATS}:
+        raise HTTPException(400, "unknown stereo_format")
+    # A preview is one clip cut out of one file - there is no meaningful
+    # "middle" of a folder.
+    if job.mode == "preview" and (job.recursive or target.is_dir()):
+        raise HTTPException(400, "preview works on a single video file, not a folder")
+
+    job_id = str(uuid.uuid4())
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO jobs (id, mode, input_path, recursive, stereo_format, params_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+            (job_id, job.mode, job.input_path, int(job.recursive), job.stereo_format,
+             json.dumps(job.params), _now()),
+        )
+        conn.commit()
+    return {"id": job_id}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    with _db() as conn:
+        row = conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "not found")
+        if row["status"] == "queued":
+            conn.execute("UPDATE jobs SET status='canceled', finished_at=? WHERE id=?", (_now(), job_id))
+            conn.commit()
+            return {"ok": True}
+    proc = _running_procs.get(job_id)
+    if proc is not None:
+        proc.send_signal(signal.SIGTERM)
+        return {"ok": True, "note": "SIGTERM sent to running job"}
+    raise HTTPException(409, "job is not queued or running")
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str):
+    with _db() as conn:
+        row = conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "not found")
+        if row["status"] in ("queued", "running"):
+            raise HTTPException(409, "cancel the job first")
+        conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        conn.commit()
+    log_path = LOG_DIR / f"{job_id}.log"
+    log_path.unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.get("/api/jobs/{job_id}/log")
+async def stream_log(job_id: str):
+    log_path = LOG_DIR / f"{job_id}.log"
+
+    async def gen():
+        # Replay what's already on disk first. Capped and batched into a
+        # handful of SSE messages, not one per line - a multi-hour job's log
+        # can run into the thousands of lines, and sending each as its own
+        # event/DOM append is what crashed the browser tab.
+        REPLAY_MAX_LINES = 500
+        REPLAY_BATCH_SIZE = 50
+        if log_path.exists():
+            with open(log_path) as f:
+                lines = f.readlines()
+            if len(lines) > REPLAY_MAX_LINES:
+                omitted = len(lines) - REPLAY_MAX_LINES
+                lines = [f"[... {omitted} earlier lines omitted ...]\n"] + lines[-REPLAY_MAX_LINES:]
+            for i in range(0, len(lines), REPLAY_BATCH_SIZE):
+                batch = "".join(lines[i:i + REPLAY_BATCH_SIZE])
+                yield f"data: {json.dumps(batch)}\n\n"
+
+        with _db() as conn:
+            row = conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None or row["status"] not in ("queued", "running"):
+            yield "event: eof\ndata: {}\n\n"
+            return
+
+        q = asyncio.Queue()
+        _log_subscribers.setdefault(job_id, set()).add(q)
+        try:
+            while True:
+                line = await q.get()
+                if line == "__EOF__":
+                    yield "event: eof\ndata: {}\n\n"
+                    break
+                yield f"data: {json.dumps(line)}\n\n"
+        finally:
+            _log_subscribers.get(job_id, set()).discard(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return (Path(__file__).parent / "static" / "index.html").read_text()
+
+
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")

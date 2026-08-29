@@ -1,0 +1,14 @@
+{
+  "id": "com.christophmh.iw3-queue",
+  "name": "iw3 Queue",
+  "version": "2.0.0",
+  "description": "Adds an 'Add to iw3 Queue' button to the video detail page. Resolves the video's file via Cove's own MaxPath and posts it to an iw3 web UI's job queue for 2D-to-stereo-3D conversion - the converting GPU can live on a different machine. Queues with a temporally consistent depth model, scene detection and EMA normalisation; iw3's own CLI defaults would silently fall back to the obsolete ZoeD_Any_N instead. Set IW3_WEBUI_URL and IW3_QUEUE_MEDIA_ROOT on the Cove container, see the extension README. No job runs inside Cove; the queued job lives in iw3's own queue and is tracked in iw3's own UI.",
+  "author": "yast2",
+  "kind": "extension",
+  "entryDll": "Iw3Queue.dll",
+  "minCoveVersion": "1.3.0",
+  "categories": [
+    "tools",
+    "library"
+  ]
+}

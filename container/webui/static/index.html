@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>iw3 - 2D to 3D converter</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --border: #2a2e37; --text: #e4e6eb;
+    --muted: #8b909c; --accent: #4f8cff; --ok: #3ecf8e; --err: #ff5c5c; --warn: #e0a940;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.4 -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .full { grid-column: 1 / -1; }
+  #browser { max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+  .entry { padding: 6px 10px; cursor: pointer; display: flex; gap: 8px; align-items: center; }
+  .entry:hover { background: #262a33; }
+  .entry.selected { background: #2c3550; }
+  .entry .icon { width: 16px; opacity: .7; }
+  #selectedPath { font-family: monospace; color: var(--accent); word-break: break-all; margin-top: 8px; min-height: 1.2em; }
+  label { display: block; margin: 10px 0 4px; color: var(--muted); font-size: 12px; }
+  input[type=number], input[type=text], select { width: 100%; background: #10131a; border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 4px; }
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
+  .checkbox-row input { width: auto; }
+  .help { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  button { background: var(--accent); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
+  button:hover { filter: brightness(1.1); }
+  button.secondary { background: #333844; }
+  button.danger { background: var(--err); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .actions { display: flex; gap: 8px; margin-top: 16px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  .status { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .status-queued { background: #333; color: var(--muted); }
+  .status-running { background: #2c3550; color: var(--accent); }
+  .status-done { background: #163d2c; color: var(--ok); }
+  .status-failed { background: #3d1f1f; color: var(--err); }
+  .status-canceled { background: #333; color: var(--muted); }
+  .job-actions button { padding: 3px 8px; font-size: 11px; }
+  .bar { position: relative; height: 6px; background: #10131a; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; min-width: 130px; }
+  .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+  /* The scene-detection pre-pass reports no total, so there is no honest
+     percentage to draw - show motion instead of a made-up width. */
+  .bar.indeterminate > span { width: 35%; animation: slide 1.4s ease-in-out infinite; }
+  @keyframes slide { 0% { transform: translateX(-110%); } 100% { transform: translateX(320%); } }
+  .progress-meta { color: var(--muted); font-size: 11px; margin-top: 4px; white-space: nowrap; }
+  td.eta { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.eta .approx { color: var(--muted); }
+  #queueSummary { color: var(--muted); font-size: 12px; text-transform: none; letter-spacing: 0; font-weight: 400; }
+  #log { background: #0a0c10; border: 1px solid var(--border); border-radius: 6px; padding: 10px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap; display: none; }
+  .modal-close { float: right; }
+</style>
+</head>
+<body>
+<header>
+  <h1>iw3</h1>
+  <span class="help">2D &rarr; stereo-3D batch converter &middot; Intel Arc B60</span>
+</header>
+<main>
+  <div class="panel">
+    <h2>1. Source (from /input)</h2>
+    <div id="browser"></div>
+    <div id="selectedPath">No file or folder selected.</div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="recursive">
+      <label style="margin:0" for="recursive">Process recursively (folder input)</label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>2. Settings</h2>
+    <label>Stereo format</label>
+    <select id="stereoFormat"></select>
+    <div id="settingsForm"></div>
+  </div>
+
+  <div class="panel full">
+    <div class="actions">
+      <button id="btnPreview" class="secondary" title="Converts a 2-minute clip cut from the middle of the source, with the settings above. Runs before any queued conversion.">Preview (2 min clip)</button>
+      <button id="btnConvert">Add to queue</button>
+    </div>
+  </div>
+
+  <div class="panel full">
+    <h2>Job queue <span id="queueSummary"></span></h2>
+    <table>
+      <thead><tr><th>Created</th><th>Mode</th><th>Input</th><th>Format</th><th>Status</th><th>Progress</th><th>ETA</th><th></th></tr></thead>
+      <tbody id="jobRows"></tbody>
+    </table>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>
+const API = "/api";
+let schema = null;
+let currentBrowsePath = "";
+let selected = null; // {path, type}
+
+async function api(path, opts) {
+  const res = await fetch(API + path, opts);
+  if (!res.ok) { const t = await res.text(); throw new Error(t); }
+  return res.status === 204 ? null : res.json();
+}
+
+// --- File browser -----------------------------------------------------
+async function loadBrowser(path) {
+  currentBrowsePath = path;
+  const data = await api("/browse?path=" + encodeURIComponent(path));
+  const el = document.getElementById("browser");
+  el.innerHTML = "";
+  if (data.path) {
+    const up = document.createElement("div");
+    up.className = "entry";
+    up.innerHTML = `<span class="icon">..</span> ..`;
+    up.onclick = () => loadBrowser(data.path.split("/").slice(0, -1).join("/"));
+    el.appendChild(up);
+  }
+  for (const entry of data.entries) {
+    const row = document.createElement("div");
+    row.className = "entry";
+    row.innerHTML = `<span class="icon">${entry.type === "dir" ? "📁" : "🎬"}</span> ${entry.name}`;
+    row.onclick = (e) => {
+      if (entry.type === "dir" && e.detail === 2) { loadBrowser(entry.path); return; }
+      document.querySelectorAll(".entry.selected").forEach(x => x.classList.remove("selected"));
+      row.classList.add("selected");
+      selected = entry;
+      document.getElementById("selectedPath").textContent = "/input/" + entry.path
+        + (entry.type === "dir" ? "  (double-click to open, single-click selects the folder itself)" : "");
+    };
+    el.appendChild(row);
+  }
+}
+
+// --- Settings form ------------------------------------------------------
+function renderSettingsForm() {
+  const sel = document.getElementById("stereoFormat");
+  sel.innerHTML = schema.stereo_formats.map(f => `<option value="${f.value}">${f.label}</option>`).join("");
+
+  const container = document.getElementById("settingsForm");
+  container.innerHTML = "";
+  for (const f of schema.fields) {
+    const wrap = document.createElement("div");
+    if (f.kind === "bool") {
+      wrap.className = "checkbox-row";
+      wrap.innerHTML = `<input type="checkbox" id="f_${f.dest}" ${f.default ? "checked" : ""}>
+        <label style="margin:0" for="f_${f.dest}">${f.label}</label>`;
+    } else if (f.kind === "select") {
+      wrap.innerHTML = `<label>${f.label}</label>
+        <select id="f_${f.dest}">${(f.choices || []).map(c =>
+          `<option value="${c ?? ''}" ${c === f.default ? "selected" : ""}>${c ?? '(auto)'}</option>`).join("")}</select>`;
+    } else if (f.kind === "int_pair") {
+      const d = f.default || [0, 0];
+      wrap.innerHTML = `<label>${f.label}</label>
+        <div class="row">
+          <input type="number" id="f_${f.dest}_x" value="${d[0]}">
+          <input type="number" id="f_${f.dest}_y" value="${d[1]}">
+        </div>`;
+    } else {
+      wrap.innerHTML = `<label>${f.label}</label>
+        <input type="number" id="f_${f.dest}" value="${f.default ?? 0}"
+          min="${f.min ?? ''}" max="${f.max ?? ''}" step="${f.step ?? 1}">`;
+    }
+    if (f.help) wrap.innerHTML += `<div class="help">${f.help}</div>`;
+    container.appendChild(wrap);
+  }
+}
+
+function collectParams() {
+  const params = {};
+  for (const f of schema.fields) {
+    if (f.kind === "bool") params[f.dest] = document.getElementById(`f_${f.dest}`).checked;
+    else if (f.kind === "select") {
+      const v = document.getElementById(`f_${f.dest}`).value;
+      params[f.dest] = v === "" ? null : v;
+    } else if (f.kind === "int_pair") {
+      params[f.dest] = [
+        parseInt(document.getElementById(`f_${f.dest}_x`).value, 10),
+        parseInt(document.getElementById(`f_${f.dest}_y`).value, 10),
+      ];
+    } else {
+      params[f.dest] = parseFloat(document.getElementById(`f_${f.dest}`).value);
+    }
+  }
+  return params;
+}
+
+// --- Job submission -------------------------------------------------
+async function submitJob(mode) {
+  if (!selected) { alert("Select a file or folder first."); return; }
+  const body = {
+    mode,
+    input_path: selected.path,
+    recursive: document.getElementById("recursive").checked,
+    stereo_format: document.getElementById("stereoFormat").value,
+    params: collectParams(),
+  };
+  try {
+    await api("/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  } catch (e) {
+    // api() throws the server's body; a rejected job used to fail silently.
+    alert("Could not queue the job:\n\n" + e.message);
+    return;
+  }
+  refreshJobs();
+}
+document.getElementById("btnConvert").onclick = () => submitJob("convert");
+document.getElementById("btnPreview").onclick = () => submitJob("preview");
+
+// --- Job queue table --------------------------------------------------
+let openLogJobId = null;
+let logEventSource = null;
+
+// tqdm hands us seconds; show them the way a person reads a wait.
+function fmtDuration(sec) {
+  if (sec === null || sec === undefined) return "—";
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m) return `${m}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
+function progressCell(j) {
+  if (j.status === "done") {
+    return `<div class="bar"><span style="width:100%;background:var(--ok)"></span></div>`;
+  }
+  if (j.status !== "running") return "";
+  const p = j.progress;
+  if (!p) {
+    return `<div class="bar indeterminate"><span></span></div>
+            <div class="progress-meta">starting…</div>`;
+  }
+  // Cutting the preview clip happens before iw3 starts, so there is no tqdm
+  // bar to show yet - only a statement of what the job is busy with.
+  if (p.phase === "extract") {
+    return `<div class="bar indeterminate"><span></span></div>
+            <div class="progress-meta">cutting preview clip…</div>`;
+  }
+  // The scene-detection pre-pass draws its own bar. Show it, but never let it
+  // read as conversion progress - it runs at ~700 fps and finishes in seconds.
+  const scene = p.phase === "scene_detect";
+  const bar = p.percent === null
+    ? `<div class="bar indeterminate"><span></span></div>`
+    : `<div class="bar"><span style="width:${p.percent}%${scene ? ';background:var(--muted)' : ''}"></span></div>`;
+  const parts = [];
+  if (scene) parts.push("scene detection");
+  if (p.percent !== null) parts.push(`${p.percent}%`);
+  if (p.total_frames) parts.push(`${p.frames.toLocaleString()}/${p.total_frames.toLocaleString()}`);
+  else parts.push(`${p.frames.toLocaleString()} frames`);
+  parts.push(`${p.rate_fps} fps`);
+  return `${bar}<div class="progress-meta">${parts.join(" · ")}</div>`;
+}
+
+function etaCell(j) {
+  if (j.eta_sec === null || j.eta_sec === undefined) return "—";
+  const text = fmtDuration(j.eta_sec);
+  // Mark anything derived from measured throughput rather than from tqdm, so
+  // a real countdown is never confused with a projection.
+  return j.eta_estimated
+    ? `<span class="approx" title="Estimated from measured throughput, not yet reported by iw3">~${text}</span>`
+    : text;
+}
+
+async function refreshQueueSummary() {
+  const el = document.getElementById("queueSummary");
+  try {
+    const q = await api("/queue-eta");
+    if (!q.jobs) { el.textContent = ""; return; }
+    let text = `· ${q.jobs} active`;
+    if (q.total_sec !== null) {
+      text += ` · ${q.exact ? "" : "~"}${fmtDuration(q.total_sec)} remaining`;
+    }
+    if (q.jobs_counted < q.jobs) {
+      text += ` (${q.jobs - q.jobs_counted} not estimable)`;
+    }
+    el.textContent = text;
+  } catch (e) {
+    el.textContent = "";
+  }
+}
+
+async function refreshJobs() {
+  const jobs = await api("/jobs");
+  const tbody = document.getElementById("jobRows");
+  tbody.innerHTML = "";
+  for (const j of jobs) {
+    const tr = document.createElement("tr");
+    const created = new Date(j.created_at).toLocaleString();
+    tr.innerHTML = `
+      <td>${created}</td>
+      <td>${j.mode}</td>
+      <td title="${j.input_path}" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${j.input_path}</td>
+      <td>${j.stereo_format}</td>
+      <td><span class="status status-${j.status}">${j.status}</span></td>
+      <td>${progressCell(j)}</td>
+      <td class="eta">${etaCell(j)}</td>
+      <td class="job-actions"></td>
+    `;
+    const actions = tr.querySelector(".job-actions");
+    const logBtn = document.createElement("button");
+    logBtn.className = "secondary";
+    logBtn.textContent = "Log";
+    logBtn.onclick = () => showLog(j.id);
+    actions.appendChild(logBtn);
+    if (j.status === "queued" || j.status === "running") {
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "danger";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.onclick = async () => { await api(`/jobs/${j.id}/cancel`, { method: "POST" }); refreshJobs(); };
+      actions.appendChild(cancelBtn);
+    } else {
+      const delBtn = document.createElement("button");
+      delBtn.className = "secondary";
+      delBtn.textContent = "Remove";
+      delBtn.onclick = async () => { await api(`/jobs/${j.id}`, { method: "DELETE" }); refreshJobs(); };
+      actions.appendChild(delBtn);
+    }
+    tbody.appendChild(tr);
+  }
+  refreshQueueSummary();
+}
+
+// Rendering every SSE message straight into the DOM (textContent +=) is what
+// crashed the tab on a job with a huge backlog of buffered lines - a batch of
+// replay messages could still fire faster than the browser can reflow.
+// Buffer incoming text and flush at most a few times a second instead, and
+// cap total retained length so an hours-long live-tailed job can't grow the
+// DOM/string without bound.
+const LOG_MAX_CHARS = 200000;
+const LOG_FLUSH_MS = 200;
+let logBuffer = "";
+let logPending = "";
+let logFlushTimer = null;
+
+function scheduleLogFlush() {
+  if (logFlushTimer) return;
+  logFlushTimer = setTimeout(() => {
+    logFlushTimer = null;
+    if (!logPending) return;
+    logBuffer += logPending;
+    logPending = "";
+    if (logBuffer.length > LOG_MAX_CHARS) {
+      logBuffer = "[... earlier output truncated ...]\n" + logBuffer.slice(-LOG_MAX_CHARS);
+    }
+    const logEl = document.getElementById("log");
+    logEl.textContent = logBuffer;
+    logEl.scrollTop = logEl.scrollHeight;
+  }, LOG_FLUSH_MS);
+}
+
+function showLog(jobId) {
+  openLogJobId = jobId;
+  const logEl = document.getElementById("log");
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  logBuffer = "";
+  logPending = "";
+  if (logFlushTimer) { clearTimeout(logFlushTimer); logFlushTimer = null; }
+  if (logEventSource) logEventSource.close();
+  logEventSource = new EventSource(`${API}/jobs/${jobId}/log`);
+  logEventSource.onmessage = (e) => {
+    logPending += JSON.parse(e.data);
+    scheduleLogFlush();
+  };
+  logEventSource.addEventListener("eof", () => { logEventSource.close(); });
+}
+
+// --- Init ---------------------------------------------------------------
+(async function init() {
+  schema = await api("/schema");
+  renderSettingsForm();
+  await loadBrowser("");
+  await refreshJobs();
+  setInterval(refreshJobs, 3000);
+})();
+</script>
+</body>
+</html>

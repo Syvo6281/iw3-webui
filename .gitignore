@@ -1,0 +1,11 @@
+# Cove's own assemblies. They are not ours to redistribute - fetch them from
+# your own running Cove container, see cove-extension/refs/README.md.
+cove-extension/refs/*.dll
+
+# .NET build output
+[Bb]in/
+[Oo]bj/
+cove-extension/out/
+
+__pycache__/
+*.pyc
