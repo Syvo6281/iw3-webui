@@ -281,6 +281,12 @@ FALLBACK_FPS = {"4k": 2.58, "hd": 2.97}
 _rate_samples: dict[str, tuple | None] = {}
 _calibration: dict[tuple, float] = {}
 _calibration_size = -1
+_calibration_checked = 0.0
+# _estimate_seconds() runs once per queued job, and a queue is routinely
+# hundreds of jobs deep, so anything _throughput() does per call is multiplied
+# by the length of the queue on every poll of /api/jobs. Finished jobs appear
+# hours apart; re-checking a few times a minute is more than enough.
+CALIBRATION_RECHECK_SEC = 15.0
 
 
 def _bucket(height):
@@ -319,13 +325,20 @@ def _throughput():
     Median rather than mean: a job that was silently interrupted, or one that
     shared the GPU with something else, otherwise drags a whole group with it.
     """
-    global _calibration, _calibration_size
-    with _db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM jobs WHERE status='done' AND mode='convert' AND recursive=0"
-        ).fetchall()
-    if len(rows) == _calibration_size:
+    global _calibration, _calibration_size, _calibration_checked
+    now = time.monotonic()
+    if _calibration_size >= 0 and now - _calibration_checked < CALIBRATION_RECHECK_SEC:
         return _calibration
+    _calibration_checked = now
+
+    where = "status='done' AND mode='convert' AND recursive=0"
+    with _db() as conn:
+        # Count first: the row fetch and the probing behind it are only worth
+        # doing when a job has actually finished since the last look.
+        size = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {where}").fetchone()[0]
+        if size == _calibration_size:
+            return _calibration
+        rows = conn.execute(f"SELECT * FROM jobs WHERE {where}").fetchall()
 
     groups: dict[tuple, list] = {}
     for r in rows:
