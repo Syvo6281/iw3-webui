@@ -166,20 +166,32 @@ The backend is chosen with build args. `TORCH_REQUIREMENTS` names one of nunif's
 own `requirements-torch-*.txt` files, or `none` when the base image already
 ships a working torch.
 
-| Target | Build args | Status |
+| Target | `TORCH_REQUIREMENTS` | Status |
 |---|---|---|
-| Intel Arc / XPU | *(defaults)* | **Tested.** Developed and measured on an Arc Pro B60. |
-| NVIDIA / CUDA | `--build-arg BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 --build-arg TORCH_REQUIREMENTS=requirements-torch-cu126.txt --build-arg VENV_PATH=none` | **Untested here** — no NVIDIA hardware to verify on. Reports welcome. |
-| AMD / ROCm | `--build-arg TORCH_REQUIREMENTS=requirements-torch-rocm.txt` plus a ROCm base image | **Untested here.** |
-| CPU only | `--build-arg TORCH_REQUIREMENTS=requirements-torch.txt` plus `-e IW3_GPU=-1` | **Untested here.** |
+| Intel Arc / XPU | *(defaults — nothing to pass)* | **Tested.** Developed and measured on an Arc Pro B60. |
+| NVIDIA / CUDA | `requirements-torch-cu126.txt` | **Untested here** — no NVIDIA hardware to verify on |
+| AMD / ROCm | `requirements-torch-rocm.txt` | **Untested here** |
+| CPU only | `requirements-torch.txt`, plus `-e IW3_GPU=-1` at run time | **Untested here** |
 
-CUDA and ROCm also need their own device flags at `docker run` (`--gpus all`,
-or `--device /dev/kfd --device /dev/dri`) instead of the Intel `--device
-/dev/dri`.
+The default base image is Intel's, and it is the only one that already carries
+a matching torch. Any other base also needs `BASE_IMAGE` and `VENV_PATH` — for
+example `nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04` with `VENV_PATH=/usr`
+(the tag exists; whether the build succeeds against it, I do not know).
+
+Two obstacles you will hit on a plain distro base that the Intel image hides,
+and that the Dockerfile does not yet solve for you:
+
+- the apt layer installs `python3-dev` but no `python3-pip`
+- Ubuntu 24.04 refuses a system-wide `pip install` (PEP 668), so the install
+  wants a real virtualenv at `VENV_PATH` rather than `/usr`
 
 I would rather say "untested" than imply a build I have never run works. If you
-get one of these going, a PR correcting this table is the most useful thing you
-could send.
+get one of these going, a PR fixing the Dockerfile and this table is the most
+useful thing you could send.
+
+Non-Intel backends also need their own device flags at `docker run` — `--gpus
+all` for CUDA, `--device /dev/kfd --device /dev/dri` for ROCm — instead of the
+Intel `--device /dev/dri`.
 
 ## Security
 
