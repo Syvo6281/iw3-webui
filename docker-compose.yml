@@ -1,0 +1,88 @@
+# One command per backend. Pick your profile:
+#
+#   docker compose --profile cuda up -d      # NVIDIA
+#   docker compose --profile xpu  up -d      # Intel Arc
+#   docker compose --profile rocm up -d      # AMD
+#   docker compose --profile cpu  up -d      # no GPU
+#
+# Only the device wiring differs between them - the image and the settings are
+# the same. Edit the three paths under x-common below and you are done.
+#
+# By default these pull the prebuilt images. To build locally instead, add
+# `--build` and see container/BUILD.md.
+
+x-common: &common
+  restart: unless-stopped
+  ports:
+    - "8790:8790"
+  volumes:
+    # Model checkpoints, the job queue and the per-job logs. Keep it.
+    - ./config:/config
+    # Your source videos. Read-only: nothing here is ever written to.
+    - /path/to/your/videos:/input:ro
+    # Where converted files land.
+    - /path/to/your/output:/output
+  environment:
+    # Own the output files. Match these to your own user, or the files will
+    # come out owned by somebody else.
+    PUID: "1000"
+    PGID: "1000"
+    UMASK: "000"
+    # "auto" resolves to the first accelerator it can see, or the CPU if there
+    # is none. Set 0/1/-1 to decide yourself.
+    IW3_GPU: "auto"
+    # Length of the clip the Preview button cuts out of the middle of a source.
+    PREVIEW_CLIP_SECONDS: "120"
+
+services:
+  iw3-cuda:
+    <<: *common
+    profiles: ["cuda"]
+    image: ghcr.io/yast2/iw3-webui:cuda
+    build:
+      context: ./container
+      args:
+        BASE_IMAGE: pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime
+        VENV_PATH: /opt/conda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  iw3-xpu:
+    <<: *common
+    profiles: ["xpu"]
+    image: ghcr.io/yast2/iw3-webui:xpu
+    build:
+      context: ./container
+    devices:
+      - /dev/dri:/dev/dri
+
+  iw3-rocm:
+    <<: *common
+    profiles: ["rocm"]
+    image: ghcr.io/yast2/iw3-webui:rocm
+    build:
+      context: ./container
+      args:
+        BASE_IMAGE: rocm/pytorch:rocm6.3_ubuntu24.04_py3.12_pytorch_release_2.4.0
+        VENV_PATH: /usr
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+
+  iw3-cpu:
+    <<: *common
+    profiles: ["cpu"]
+    image: ghcr.io/yast2/iw3-webui:cpu
+    build:
+      context: ./container
+      args:
+        BASE_IMAGE: python:3.12-slim
+        VENV_PATH: /usr
+        TORCH_INSTALL: "--index-url https://download.pytorch.org/whl/cpu torch==2.7.1 torchvision==0.22.1"

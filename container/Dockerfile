@@ -4,10 +4,15 @@
 # The GPU backend is chosen entirely through build args - see BUILD.md for the
 # per-vendor invocations:
 #
-#   BASE_IMAGE          a base providing Python and, ideally, a working torch
-#   TORCH_REQUIREMENTS  one of nunif's requirements-torch-*.txt, or "none" when
-#                       the base image already ships torch
-#   VENV_PATH           prepended to PATH; "none" for the system Python
+#   BASE_IMAGE     a base providing Python and, ideally, a working torch
+#   TORCH_INSTALL  pip arguments that install torch, or empty when the base
+#                  image already carries the right one
+#   VENV_PATH      directory whose bin/ holds the Python to use
+#
+# There is deliberately no vendor-specific code anywhere below this line, and
+# none is needed: nunif resolves the backend itself (cuda -> mps -> xpu, see
+# nunif/device.py), so a build differs from another only in which base image
+# carries which torch. BUILD.md has the per-vendor invocations.
 #
 # The defaults below are the Intel Arc / XPU combination this was developed
 # and measured on. Base image choice: Intel's own PyTorch-XPU container
@@ -28,13 +33,17 @@
 ARG BASE_IMAGE=intel/pytorch:xpu-2.11.0-ubuntu24.04
 FROM ${BASE_IMAGE}
 
-ARG TORCH_REQUIREMENTS=none
+ARG TORCH_INSTALL=""
 ARG VENV_PATH=/opt/venv
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NUNIF_HOME=/config
-# A base image that ships torch inside a venv (Intel's does) needs that venv
-# on PATH; a plain distro base has none.
+# Which Python gets used is decided here and nowhere else. Base images put it
+# in different places - Intel's in /opt/venv, PyTorch's official images in
+# /opt/conda - and the apt layer below pulls in a system python3 as a
+# dependency of python3-dev, so leaving this to chance means sometimes
+# installing into the wrong interpreter. Point VENV_PATH at the one that owns
+# torch and it stays first.
 ENV PATH="${VENV_PATH}/bin:${PATH}"
 
 # git-core, libmagickwand-dev, libraqm-dev, python3-dev: nunif's own
@@ -66,13 +75,14 @@ RUN git clone https://github.com/nagadomi/nunif.git \
     && git -C nunif log -1 --format='nunif pinned at %H (%cd) %s' --date=short
 
 WORKDIR /opt/nunif
-# With the default (XPU) base this is skipped deliberately: installing
-# requirements-torch-xpu.txt would downgrade the base image's
-# torch==2.11.0+xpu / torchvision==0.26.0+xpu to nunif's stale pin. A base
-# image that does NOT already carry a matching torch must name the right
-# requirements file here instead - see BUILD.md.
-RUN if [ "$TORCH_REQUIREMENTS" != "none" ]; then \
-        pip install --no-cache-dir -r "$TORCH_REQUIREMENTS"; \
+# Empty for the XPU and CUDA bases, and deliberately so: both already carry a
+# torch that suits them, and installing nunif's requirements-torch-*.txt on top
+# would replace it - on the XPU base with an older pin, on the CUDA base with a
+# byte-for-byte identical one after a multi-gigabyte download. Bases without
+# torch pass the pip arguments that fetch it. See BUILD.md.
+# Unquoted on purpose: this is an argument list, not one argument.
+RUN if [ -n "$TORCH_INSTALL" ]; then \
+        pip install --no-cache-dir $TORCH_INSTALL; \
     fi
 RUN pip install --no-cache-dir -r requirements.txt
 

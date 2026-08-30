@@ -52,6 +52,11 @@
   .bar.indeterminate > span { width: 35%; animation: slide 1.4s ease-in-out infinite; }
   @keyframes slide { 0% { transform: translateX(-110%); } 100% { transform: translateX(320%); } }
   .progress-meta { color: var(--muted); font-size: 11px; margin-top: 4px; white-space: nowrap; }
+  /* Running on the CPU is a legitimate state, not an error - but it is fifty
+     times slower, so it must not be something you have to go looking for. */
+  .banner { margin: 0 16px 12px; padding: 10px 14px; border-radius: 6px;
+            background: #3a2e12; border: 1px solid var(--warn); color: #f0d9a8;
+            font-size: 13px; line-height: 1.45; }
   td.eta { white-space: nowrap; font-variant-numeric: tabular-nums; }
   td.eta .approx { color: var(--muted); }
   #queueSummary { color: var(--muted); font-size: 12px; text-transform: none; letter-spacing: 0; font-weight: 400; }
@@ -62,8 +67,9 @@
 <body>
 <header>
   <h1>iw3</h1>
-  <span class="help">2D &rarr; stereo-3D batch converter &middot; Intel Arc B60</span>
+  <span class="help">2D &rarr; stereo-3D batch converter<span id="deviceLabel"></span></span>
 </header>
+<div id="deviceBanner" class="banner" hidden></div>
 <main>
   <div class="panel">
     <h2>1. Source (from /input)</h2>
@@ -109,6 +115,21 @@ async function api(path, opts) {
   const res = await fetch(API + path, opts);
   if (!res.ok) { const t = await res.text(); throw new Error(t); }
   return res.status === 204 ? null : res.json();
+}
+
+// --- Device ------------------------------------------------------------
+async function loadHealth() {
+  let h;
+  try { h = await api("/health"); } catch (e) { return; }
+  const label = document.getElementById("deviceLabel");
+  const dev = h.device === "cpu" ? "CPU" : h.device.toUpperCase();
+  const count = (h.accelerators?.[h.device]?.devices) || 0;
+  label.textContent = ` · ${dev}${count > 1 ? ` ×${count}` : ""} · torch ${h.torch}`;
+  if (h.warning) {
+    const banner = document.getElementById("deviceBanner");
+    banner.textContent = "Running on the CPU. " + h.warning;
+    banner.hidden = false;
+  }
 }
 
 // --- File browser -----------------------------------------------------
@@ -376,6 +397,7 @@ function showLog(jobId) {
 
 // --- Init ---------------------------------------------------------------
 (async function init() {
+  await loadHealth();
   schema = await api("/schema");
   renderSettingsForm();
   await loadBrowser("");

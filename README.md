@@ -43,43 +43,55 @@ The extension needs the container. The container does not need the extension.
 ## Requirements
 
 - Docker
-- A GPU passed into the container, or patience (CPU works; it is very slow)
+- A GPU passed into the container, or patience (the CPU works; it is very slow)
 - Somewhere to read source video from, and somewhere to write results to
 
 ## Quick start
 
-Build for an Intel Arc GPU (the default, and the only combination tested here —
-see [Other GPUs](#other-gpus)):
-
-```sh
-cd container
-docker build -t iw3-webui .
-```
-
-Run it:
+Images are prebuilt per backend, so there is nothing to compile. Pick the tag
+that matches your GPU — `cuda`, `xpu` or `cpu`:
 
 ```sh
 docker run -d --name iw3 \
   --restart unless-stopped \
+  --gpus all \
   -p 8790:8790 \
-  --device /dev/dri:/dev/dri:rwm \
   -e PUID=1000 -e PGID=1000 \
   -v /path/to/config:/config \
   -v /path/to/videos:/input:ro \
   -v /path/to/output:/output \
-  iw3-webui
+  ghcr.io/yast2/iw3-webui:cuda
 ```
 
 Then open `http://<host>:8790`.
 
-Check that the GPU actually arrived — this is the one thing a build cannot
-verify for you:
+The device flag differs, and it is the one thing worth getting right:
+
+| Backend | tag | flag |
+|---|---|---|
+| NVIDIA | `:cuda` | `--gpus all` |
+| Intel Arc | `:xpu` | `--device /dev/dri:/dev/dri:rwm` |
+| no GPU | `:cpu` | *(none)* |
+
+There is no device to configure beyond that. `IW3_GPU` defaults to `auto`: the
+container looks for an accelerator at startup and uses it, or falls back to the
+CPU. Set `0`, `1` or `-1` if you would rather decide yourself.
+
+Or with compose — `docker compose --profile cuda up -d`, after editing the
+three paths in [`docker-compose.yml`](docker-compose.yml).
+
+### If it seems slow, it is probably on the CPU
+
+Forgetting the device flag does not produce an error. It produces a container
+that works and is dozens of times slower, which looks exactly like a big job.
+So the container refuses to be quiet about it: a line in the startup log, a
+banner across the top of the web UI, and:
 
 ```sh
 curl -s localhost:8790/api/health
 ```
 
-An empty `accelerators` list means every conversion will run on the CPU.
+`"device": "cpu"` with a `warning` means the GPU never made it in.
 
 ### Volumes
 
@@ -152,7 +164,7 @@ Everything below is an environment variable on the container.
 | `WEBUI_PORT` | `8790` | Port inside the container |
 | `PUID` / `PGID` | `99` / `100` | User/group the process drops to; owns the output files |
 | `UMASK` | `000` | umask for created files |
-| `IW3_GPU` | `0` | Passed to iw3's `--gpu`. `-1` is CPU; `1` is a second card. |
+| `IW3_GPU` | `auto` | `auto` detects the accelerator; `0`/`1` pick one explicitly, `-1` forces the CPU |
 | `PREVIEW_CLIP_SECONDS` | `120` | Length of the preview clip |
 | `FFMPEG_BIN` | `ffmpeg` | ffmpeg used for clip extraction |
 | `NUNIF_HOME` | `/config` | Checkpoints, queue database, logs |
@@ -162,36 +174,29 @@ between concurrent conversions.
 
 ## Other GPUs
 
-The backend is chosen with build args. `TORCH_REQUIREMENTS` names one of nunif's
-own `requirements-torch-*.txt` files, or `none` when the base image already
-ships a working torch.
+There is no vendor-specific code in this project, and none is needed: nunif
+resolves the backend itself (`cuda` → `mps` → `xpu`, see `nunif/device.py`), so
+one build differs from another only in which base image carries which torch.
+The full matrix and the build commands are in
+[`container/BUILD.md`](container/BUILD.md).
 
-| Target | `TORCH_REQUIREMENTS` | Status |
+What is actually verified:
+
+| Backend | builds | converts |
 |---|---|---|
-| Intel Arc / XPU | *(defaults — nothing to pass)* | **Tested.** Developed and measured on an Arc Pro B60. |
-| NVIDIA / CUDA | `requirements-torch-cu126.txt` | **Untested here** — no NVIDIA hardware to verify on |
-| AMD / ROCm | `requirements-torch-rocm.txt` | **Untested here** |
-| CPU only | `requirements-torch.txt`, plus `-e IW3_GPU=-1` at run time | **Untested here** |
+| Intel Arc / XPU | ✅ | ✅ **measured** on an Arc Pro B60 |
+| NVIDIA / CUDA | ✅ in CI | ❓ never run — no NVIDIA hardware here |
+| CPU only | ✅ in CI | ❓ never run |
+| AMD / ROCm | ❓ not in CI | ❓ never run |
 
-The default base image is Intel's, and it is the only one that already carries
-a matching torch. Any other base also needs `BASE_IMAGE` and `VENV_PATH` — for
-example `nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04` with `VENV_PATH=/usr`
-(the tag exists; whether the build succeeds against it, I do not know).
+Every push builds all three CI backends and runs a smoke test that imports
+torch and iw3 inside the finished image, so a broken Dockerfile is caught
+without hardware. Whether the *conversion* is correct on CUDA or ROCm is a
+question this project cannot answer on its own.
 
-Two obstacles you will hit on a plain distro base that the Intel image hides,
-and that the Dockerfile does not yet solve for you:
-
-- the apt layer installs `python3-dev` but no `python3-pip`
-- Ubuntu 24.04 refuses a system-wide `pip install` (PEP 668), so the install
-  wants a real virtualenv at `VENV_PATH` rather than `/usr`
-
-I would rather say "untested" than imply a build I have never run works. If you
-get one of these going, a PR fixing the Dockerfile and this table is the most
-useful thing you could send.
-
-Non-Intel backends also need their own device flags at `docker run` — `--gpus
-all` for CUDA, `--device /dev/kfd --device /dev/dri` for ROCm — instead of the
-Intel `--device /dev/dri`.
+I would rather say "unverified" than imply a result I have never seen. If you
+run one of these, a report — or a PR correcting this table — is the most useful
+thing you could send.
 
 ## Security
 

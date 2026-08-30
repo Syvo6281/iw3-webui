@@ -48,10 +48,67 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # logos and fades often enough to be unrepresentative.
 PREVIEW_CLIP_SECONDS = float(os.environ.get("PREVIEW_CLIP_SECONDS", "120"))
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
-# Passed straight to iw3's --gpu. "-1" is iw3's own spelling for CPU; a second
-# card is "1". Only one job runs at a time either way - iw3 was not built to
-# share a device between concurrent conversions.
-IW3_GPU = os.environ.get("IW3_GPU", "0")
+
+# ---------------------------------------------------------------------------
+# Which device to convert on
+#
+# There is no vendor-specific code here and there does not need to be: nunif
+# resolves the backend itself for any device id >= 0 (nunif/device.py) -
+#
+#     cuda -> mps -> xpu, and ValueError if none of them is there
+#
+# so the only real choice is "an accelerator" versus "the CPU". "auto" makes
+# that choice by looking, which is what lets one image run on an NVIDIA box, an
+# Intel box and a machine with no GPU at all without being reconfigured.
+#
+# Falling back to the CPU is allowed. Falling back *quietly* is not: it is
+# roughly fifty times slower, and a job that merely takes forever looks exactly
+# like a job that is working. So the fallback is announced in the startup log,
+# in /api/health and as a banner across the top of the web UI.
+# ---------------------------------------------------------------------------
+IW3_GPU_SETTING = os.environ.get("IW3_GPU", "auto")
+
+
+def _detect_accelerator():
+    """(name, count) of the accelerator nunif would pick, or (None, 0)."""
+    try:
+        import torch
+    except Exception:
+        return None, 0
+    for name in ("cuda", "mps", "xpu"):
+        backend = getattr(torch, name, None)
+        if backend is None:
+            continue
+        try:
+            if name == "mps":
+                available = torch.backends.mps.is_available()
+                count = 1 if available else 0
+            else:
+                available = backend.is_available()
+                count = backend.device_count() if available else 0
+        except Exception:
+            continue
+        if available:
+            return name, count
+    return None, 0
+
+
+def _resolve_gpu(setting):
+    """(value for --gpu, accelerator name or None, warning or None)."""
+    if setting.strip().lower() != "auto":
+        return setting, None, None
+    name, _ = _detect_accelerator()
+    if name:
+        return "0", name, None
+    return "-1", None, (
+        "No CUDA, MPS or XPU device is visible - every conversion will run on "
+        "the CPU, which is far slower than any GPU. If this machine has a GPU, "
+        "the container was most likely started without access to it "
+        "(--gpus all for NVIDIA, --device /dev/dri for Intel/AMD)."
+    )
+
+
+IW3_GPU, ACCELERATOR, DEVICE_WARNING = _resolve_gpu(IW3_GPU_SETTING)
 
 # ---------------------------------------------------------------------------
 # Settings schema - introspected from iw3's own argparse parser so defaults
@@ -702,6 +759,14 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def _startup():
+    # First thing in the log, because it is the first thing to check when
+    # conversions turn out to be slow.
+    if ACCELERATOR:
+        print(f"[iw3-webui] device: {ACCELERATOR} (--gpu {IW3_GPU})", flush=True)
+    elif DEVICE_WARNING:
+        print(f"[iw3-webui] WARNING: {DEVICE_WARNING}", flush=True)
+    else:
+        print(f"[iw3-webui] device: --gpu {IW3_GPU} (set explicitly via IW3_GPU)", flush=True)
     asyncio.create_task(_worker_loop())
 
 
@@ -751,7 +816,10 @@ def health():
     return {
         "torch": torch.__version__,
         "accelerators": accelerators,
+        "device": ACCELERATOR or "cpu",
         "iw3_gpu": IW3_GPU,
+        "iw3_gpu_setting": IW3_GPU_SETTING,
+        "warning": DEVICE_WARNING,
         "ffmpeg": shutil.which(FFMPEG_BIN),
         "preview_clip_seconds": PREVIEW_CLIP_SECONDS,
         "input_root": str(INPUT_ROOT),
