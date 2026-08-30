@@ -18,20 +18,30 @@ is nothing else to change.
 |---|---|---|---|
 | Intel (XPU) | `intel/pytorch:xpu-2.11.0-ubuntu24.04` | *(empty)* | `/opt/venv` |
 | NVIDIA (CUDA) | `pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime` | *(empty)* | `/opt/conda` |
-| AMD (ROCm) | `rocm/pytorch:rocm6.3_ubuntu24.04_py3.12_pytorch_release_2.4.0` | *(empty)* | `/usr` |
-| CPU only | `python:3.12-slim` | `--index-url https://download.pytorch.org/whl/cpu torch==2.7.1 torchvision==0.22.1` | `/usr` |
+| AMD (ROCm) | `rocm/pytorch:rocm6.3_ubuntu24.04_py3.12_pytorch_release_2.4.0` | *(empty)* | `/opt/conda/envs/py_3.12` |
+| CPU only | `python:3.12-slim` | `--index-url https://download.pytorch.org/whl/cpu torch==2.7.1 torchvision==0.22.1` | `/usr/local` |
 
 Intel and CUDA are the tidy cases: both base images already ship a torch that
 matches, so nothing is installed over the top. For CUDA the match is exact —
 that image carries `torch 2.7.1+cu126`, which is precisely what nunif's own
 `requirements-torch-cu126.txt` pins.
 
-`VENV_PATH` is not decoration. The apt layer installs `python3-dev`, which
-drags in a system `python3`; if that ends up ahead of the interpreter that owns
-torch, the build installs nunif into the wrong Python and the container starts
-without torch. Point `VENV_PATH` at the Python that owns torch. Verified for
-the CUDA base, whose own `PATH` reads
-`/usr/local/nvidia/bin:/usr/local/cuda/bin:/opt/conda/bin:…`.
+`VENV_PATH` is not decoration, and it is the one arg that is easy to get
+wrong. The apt layer installs `python3-dev`, which drags in a Debian `python3`
+under `/usr/bin`. If that ends up ahead of the interpreter that owns torch, pip
+installs into one Python and the container runs the other — and the failure
+does not surface until something imports torch.
+
+The first CI run of this project hit exactly that: `python:3.12-slim` keeps its
+Python in `/usr/local/bin`, `VENV_PATH=/usr` put Debian's in front, and the
+build died on `ModuleNotFoundError: No module named 'torch'`.
+
+So point `VENV_PATH` at the directory whose `bin/` holds the Python that owns
+torch, and check rather than assume. For a base image:
+
+```sh
+docker run --rm <base image> sh -c 'command -v python3; python3 -c "import torch, sys; print(sys.executable, torch.__version__)"'
+```
 
 ## Commands
 
@@ -55,7 +65,7 @@ CPU:
 ```sh
 docker build -t iw3-webui:cpu \
   --build-arg BASE_IMAGE=python:3.12-slim \
-  --build-arg VENV_PATH=/usr \
+  --build-arg VENV_PATH=/usr/local \
   --build-arg TORCH_INSTALL="--index-url https://download.pytorch.org/whl/cpu torch==2.7.1 torchvision==0.22.1" \
   container/
 ```
@@ -98,10 +108,14 @@ docker build --build-arg NUNIF_REF=<sha> container/
 
 | | builds | converts |
 |---|---|---|
-| Intel XPU | ✅ | ✅ measured on an Arc Pro B60 |
+| Intel XPU | ✅ in CI | ✅ measured on an Arc Pro B60 |
 | NVIDIA CUDA | ✅ in CI | ❓ never run — no NVIDIA hardware here |
 | CPU | ✅ in CI | ❓ never run |
-| AMD ROCm | ❓ | ❓ |
+| AMD ROCm | ❓ not in CI — the base image is too large for a stock runner | ❓ never run |
+
+The ROCm row's `VENV_PATH` was read out of that image's published config
+(`/opt/conda/envs/py_3.12/bin` comes first on its own `PATH`) rather than
+guessed, but nothing beyond that has been checked.
 
 CI builds every variant on each push, so "the Dockerfile is broken" is caught
 without hardware. Whether inference is correct on CUDA or ROCm is a different

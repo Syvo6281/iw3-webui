@@ -36,7 +36,12 @@ jobs:
             torch: ""
           - backend: cpu
             base: python:3.12-slim
-            venv: /usr
+            # /usr/local, not /usr: the slim image's own Python is in
+            # /usr/local/bin, while the apt layer's python3-dev drags a Debian
+            # python3 into /usr/bin. Naming /usr first puts the wrong one ahead
+            # of the one pip installs into - which is how the first CI run of
+            # this workflow failed.
+            venv: /usr/local
             torch: "--index-url https://download.pytorch.org/whl/cpu torch==2.7.1 torchvision==0.22.1"
 
     steps:
