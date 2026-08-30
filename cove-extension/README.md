@@ -26,10 +26,10 @@ docker run --rm -v "$PWD":/work -w /work/src/Iw3Queue \
 Copy three files into a directory of their own under Cove's extension folder:
 
 ```sh
-mkdir -p /path/to/cove/config/extensions/com.christophmh.iw3-queue
+mkdir -p /path/to/cove/config/extensions/com.yast2.iw3-queue
 cp out/Iw3Queue.dll out/Iw3Queue.deps.json \
    src/Iw3Queue/extension.json \
-   /path/to/cove/config/extensions/com.christophmh.iw3-queue/
+   /path/to/cove/config/extensions/com.yast2.iw3-queue/
 docker restart Cove
 ```
 
@@ -59,11 +59,11 @@ Cove and iw3 see the same files under different mount points. `IW3_QUEUE_MEDIA_R
 is the Cove side of that mapping: it is stripped from Cove's stored path, and
 what remains is the path relative to iw3's `/input`.
 
-With Cove mounting `/mnt/user:/media` and iw3 mounting `/mnt/user/torrent:/input`:
+With Cove mounting `/mnt/user:/media` and iw3 mounting `/mnt/user/videos:/input`:
 
 ```
-Cove path   /media/torrent/films/example.mkv
-prefix      /media/torrent/
+Cove path   /media/videos/films/example.mkv
+prefix      /media/videos/
 sent to iw3 films/example.mkv
 ```
 

@@ -30,7 +30,7 @@ suffix Quest players use for stereo-format auto-detection.
 | Flag | Value | Why |
 |---|---|---|
 | `-u 99:100` | (docker exec flag, not iw3's) | **Required.** `docker exec` bypasses `entrypoint.sh`'s PUID/PGID drop and runs as root by default. Without it, output files (and any new torch.hub cache entries) land root-owned and can silently block later runs as the unprivileged user. |
-| `-i` | path under `/input` | Source file. `/input` is the torrent share, mounted read-only. |
+| `-i` | path under `/input` | Source file. `/input` is your source share, mounted read-only. |
 | `-o` | `/output` (a **directory**, never a filename) | iw3 auto-names the output `{original}_LRF_Full_SBS.mp4` only when `-o` is a directory. Passing a filename skips the naming convention Quest players rely on for format auto-detection. |
 | `--depth-model VDA_L` | Video-Depth-Anything Large (the queue defaults to `VDA_B`, roughly twice as fast for a small quality difference) | Temporally consistent depth estimation across frames — unlike single-frame models (e.g. `Any_V2_L`), it doesn't independently re-guess depth every frame, so it doesn't flicker on video. Use `VDA_Metric_L` instead if the scene reads as flat or over-curved — it estimates absolute-scale depth rather than relative. |
 | `--divergence 2.0` | iw3 default | 3D strength / simulated eye separation. Higher = more pop, more eye strain. 2.0 is iw3's own moderate default; lower it (e.g. 1.0–1.5) for less aggressive depth. |

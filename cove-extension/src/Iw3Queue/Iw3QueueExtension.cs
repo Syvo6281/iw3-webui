@@ -42,8 +42,8 @@ public sealed class Iw3QueueExtension : CoveExtensionBase, IActionExtension, IAp
     // to iw3's /input. Stripping it also validates - a video outside this subtree cannot be
     // reached by iw3 at all and is rejected rather than sent as a wrong path.
     //
-    // Example: Cove has /mnt/user:/media and iw3 has /mnt/user/torrent:/input, so the prefix
-    // is "/media/torrent/". Mount both at the same path and it is just "/media/".
+    // Example: Cove has /mnt/user:/media and iw3 has /mnt/user/videos:/input, so the prefix
+    // is "/media/videos/". Mount both at the same path and it is just "/media/".
     private static readonly string CoveMediaRoot =
         EnsureTrailingSlash(Environment.GetEnvironmentVariable("IW3_QUEUE_MEDIA_ROOT") ?? "/media/");
 
